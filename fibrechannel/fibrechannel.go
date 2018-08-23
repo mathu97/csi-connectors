@@ -1,12 +1,15 @@
 package fibrechannel
 
 import (
-	"github.com/j-griffith/csi-connectors/logger"
-	"os"
-	"os/exec"
-	"io/ioutil"
-	"path/filepath"
 	"fmt"
+	"github.com/j-griffith/csi-connectors/logger"
+	"io/ioutil"
+	"k8s.io/kubernetes/pkg/util/mount"
+	volumeutil "k8s.io/kubernetes/pkg/volume/util"
+	"os"
+
+	"path"
+	"path/filepath"
 	"strings"
 )
 
@@ -14,21 +17,26 @@ var log *logger.Logger
 
 //Connector provides a struct to hold all of the needed parameters to make our fibrechannel connection
 type Connector struct {
-	VolumeName       string
-	TargetWWNs       []string
-	Lun              string
-	WWIDs            []string
+	VolumeName string
+	TargetWWNs []string
+	Lun        string
+	WWIDs      []string
+}
+
+type FCMounter struct {
+	ReadOnly     bool
+	FsType       string
+	MountOptions []string
+	Mounter      *mount.SafeFormatAndMount
+	Exec         mount.Exec
+	DeviceUtil   volumeutil.DeviceUtil
+	TargetPath   string
 }
 
 func init() {
 	// TODO: add a handle to configure loggers after init
 	// also, make default for trace to go to discard when you're done messing around
 	log = logger.NewLogger(os.Stdout, os.Stdout, os.Stdout, os.Stderr)
-}
-
-func runCmd(cmd string, args ...string) (string, error) {
-	out, err := exec.Command(cmd, args...).CombinedOutput()
-	return string(out), err
 }
 
 func getMultipathDisk(path string) (string, error) {
@@ -75,7 +83,7 @@ func scsiHostRescan() {
 	}
 }
 
-func searchDisk(c Connector) (string, error){
+func searchDisk(c Connector) (string, error) {
 	var diskIds []string
 	var disk string
 	var dm string
@@ -126,7 +134,6 @@ func searchDisk(c Connector) (string, error){
 	return disk, nil
 }
 
-
 // given a wwn and lun, find the device and associated devicemapper parent
 func findDisk(wwn, lun string) (string, string) {
 	FC_PATH := "-fc-0x" + wwn + "-lun-" + lun
@@ -171,7 +178,7 @@ func findDiskWWIDs(wwid string) (string, string) {
 					return "", ""
 				}
 				dm, err1 := getMultipathDisk(DEV_ID + name)
-				if err1 == nil{
+				if err1 == nil {
 					log.Trace.Printf("fc: find disk: %v, dm: %v", disk, dm)
 					return disk, dm
 				}
@@ -183,8 +190,7 @@ func findDiskWWIDs(wwid string) (string, string) {
 	return "", ""
 }
 
-
-// Connect attempts to connect a volume to this node using the provided Connector info
+// Connect attempts to connect a fc volume to this node using the provided Connector info
 func Connect(c Connector) (string, error) {
 	devicePath, err := searchDisk(c)
 
@@ -194,4 +200,95 @@ func Connect(c Connector) (string, error) {
 	}
 
 	return devicePath, nil
+}
+
+func Disconnect(c Connector, devicePath string) error {
+	var devices []string
+	dstPath, err := filepath.EvalSymlinks(devicePath)
+
+	if err != nil {
+		return err
+	}
+
+	if strings.HasPrefix(dstPath, "/dev/dm-") {
+		devices = FindSlaveDevicesOnMultipath(dstPath)
+	} else {
+		// Add single devicepath to devices
+		devices = append(devices, dstPath)
+	}
+
+	log.Trace.Printf("fc: DetachDisk devicePath: %v, dstPath: %v, devices: %v", devicePath, dstPath, devices)
+
+	var lastErr error
+
+	for _, device := range devices {
+		err := detachFCDisk(device)
+		if err != nil {
+			log.Error.Printf("fc: detachFCDisk failed. device: %v err: %v", device, err)
+			lastErr = fmt.Errorf("fc: detachFCDisk failed. device: %v err: %v", device, err)
+		}
+	}
+
+	if lastErr != nil {
+		log.Error.Printf("fc: last error occurred during detach disk:\n%v", lastErr)
+		return lastErr
+	}
+
+	return nil
+}
+
+func FindSlaveDevicesOnMultipath(dm string) []string {
+	var devices []string
+	// Split path /dev/dm-1 into "", "dev", "dm-1"
+	parts := strings.Split(dm, "/")
+	if len(parts) != 3 || !strings.HasPrefix(parts[1], "dev") {
+		return devices
+	}
+	disk := parts[2]
+	slavesPath := path.Join("/sys/block/", disk, "/slaves/")
+	if files, err := ioutil.ReadDir(slavesPath); err == nil {
+		for _, f := range files {
+			devices = append(devices, path.Join("/dev/", f.Name()))
+		}
+	}
+	return devices
+}
+
+// detachFCDisk removes scsi device file such as /dev/sdX from the node.
+func detachFCDisk(devicePath string) error {
+	// Remove scsi device from the node.
+	if !strings.HasPrefix(devicePath, "/dev/") {
+		return fmt.Errorf("fc detach disk: invalid device name: %s", devicePath)
+	}
+	arr := strings.Split(devicePath, "/")
+	dev := arr[len(arr)-1]
+	removeFromScsiSubsystem(dev)
+	return nil
+}
+
+// Removes a scsi device based upon /dev/sdX name
+func removeFromScsiSubsystem(deviceName string) {
+	fileName := "/sys/block/" + deviceName + "/device/delete"
+	log.Trace.Printf("fc: remove device from scsi-subsystem: path: %s", fileName)
+	data := []byte("1")
+	ioutil.WriteFile(fileName, data, 0666)
+}
+
+func MountDisk(mnter FCMounter, devicePath string) error {
+	mntPath := mnter.TargetPath
+	notMnt, err := mnter.Mounter.IsLikelyNotMountPoint(mntPath)
+
+	if err != nil {
+		return fmt.Errorf("Heuristic determination of mount point failed: %v", err)
+	}
+
+	if !notMnt {
+		log.Trace.Printf("fc: %s already mounted", mnter.TargetPath)
+	}
+
+	if err = mnter.Mounter.FormatAndMount(devicePath, mnter.TargetPath, mnter.FsType, nil); err != nil {
+		return fmt.Errorf("fc: failed to mount fc volume %s [%s] to %s, error %v", devicePath, mnter.FsType, mnter.TargetPath, err)
+	}
+
+	return nil
 }
